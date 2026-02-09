@@ -1,0 +1,34 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: meet-transcriber
+
+# Meeting Configuration (anonymous join - no Google account)
+meeting:
+  # Display name when joining Meet as guest (fixed name)
+  bot-name: ${MEETING_BOT_NAME:Ravi BKL}
+  # Thread pool for concurrent meetings
+  max-concurrent-meetings: 10
+  # Transcript storage path
+  transcript-path: ${TRANSCRIPT_PATH:/tmp/transcripts}
+  # How long to wait for host to admit the bot (seconds) when "Ask to join" is required
+  admission-timeout-seconds: ${ADMISSION_TIMEOUT:120}
+
+# Playwright Configuration
+playwright:
+  # Set to false to see the browser window (useful for debugging)
+  headless: ${PLAYWRIGHT_HEADLESS:true}
+  # Browser user data directory for session persistence
+  user-data-dir: ${PLAYWRIGHT_USER_DATA:/tmp/playwright-data}
+  # Slow down operations for stability (milliseconds)
+  slow-mo: 100
+
+# Logging
+logging:
+  level:
+    root: INFO
+    com.transcriber: DEBUG
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"

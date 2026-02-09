@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  meet-transcriber:
+    build: .
+    container_name: meet-transcriber
+    ports:
+      - "8080:8080"
+    environment:
+      # Anonymous join - display name in Meet (optional, default: Alexa)
+      - MEETING_BOT_NAME=${MEETING_BOT_NAME:-Alexa}
+      
+      # Application Settings
+      - TRANSCRIPT_PATH=/data/transcripts
+      - PLAYWRIGHT_USER_DATA=/data/playwright
+      
+      # Java Settings
+      - JAVA_OPTS=-Xmx1g -Xms512m
+    volumes:
+      # Persist transcripts
+      - transcript-data:/data/transcripts
+      # Optional: persist browser data
+      - playwright-data:/data/playwright
+    restart: unless-stopped
+    
+    # For running Playwright in container
+    security_opt:
+      - seccomp:unconfined
+    shm_size: '2gb'
+
+volumes:
+  transcript-data:
+  playwright-data:
