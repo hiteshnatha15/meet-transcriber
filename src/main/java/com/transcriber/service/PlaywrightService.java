@@ -41,16 +41,19 @@ public class PlaywrightService {
     @Value("${meeting.admission-timeout-seconds:120}")
     private int admissionTimeoutSeconds;
 
-    private Playwright playwright;
-    
     // Track active browser contexts per meeting
     private final ConcurrentHashMap<String, BrowserContext> activeContexts = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, AtomicBoolean> stopFlags = new ConcurrentHashMap<>();
 
     @PostConstruct
     public void init() {
-        playwright = Playwright.create();
-        log.info("Playwright initialized");
+        // Validate Playwright is available by creating and immediately closing an instance
+        try (Playwright pw = Playwright.create()) {
+            log.info("Playwright verified and available (version check on startup)");
+        } catch (Exception e) {
+            log.error("Playwright NOT available! Install browsers with: mvn exec:java -e -Dexec.mainClass=com.microsoft.playwright.CLI -Dexec.args=\"install chromium\"");
+            throw new RuntimeException("Playwright initialization failed", e);
+        }
     }
 
     @PreDestroy
@@ -62,9 +65,6 @@ public class PlaywrightService {
                 log.warn("Error closing browser context: {}", e.getMessage());
             }
         });
-        if (playwright != null) {
-            playwright.close();
-        }
         log.info("Playwright resources cleaned up");
     }
 
@@ -75,10 +75,17 @@ public class PlaywrightService {
         String uuid = session.getUuid();
         stopFlags.put(uuid, new AtomicBoolean(false));
         
+        // Each meeting gets its own Playwright instance on the calling thread.
+        // Playwright Java is NOT thread-safe -- the instance must be created and
+        // used on the same thread, so we cannot share a single @PostConstruct instance.
+        Playwright playwright = null;
         BrowserContext context = null;
         Page page = null;
 
         try {
+            log.info("[{}] Creating Playwright instance on thread: {}", uuid, Thread.currentThread().getName());
+            playwright = Playwright.create();
+
             log.info("[{}] Starting browser for meeting: {}", uuid, session.getMeetUrl());
             log.info("[{}] Using anti-detection mode to bypass bot detection", uuid);
             session.setStatus(MeetingSession.MeetingStatus.JOINING);
@@ -108,7 +115,7 @@ public class PlaywrightService {
                     )));
 
             // Real Chrome user agent to avoid detection
-            String realUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
+            String realUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
             context = browser.newContext(new Browser.NewContextOptions()
                     .setPermissions(java.util.List.of("microphone", "camera", "notifications"))
@@ -168,6 +175,10 @@ public class PlaywrightService {
             joinMeeting(page, uuid);
             session.setStatus(MeetingSession.MeetingStatus.IN_PROGRESS);
 
+            // Safety net: handle any remaining consent/notification dialogs
+            // (Gemini notes, recording consent, self-view "Got it", etc.)
+            handleRecordingConsentDialogs(page, uuid);
+
             // Enable captions (reduced delay from 2s to 1s)
             Thread.sleep(1000);
             enableCaptions(page, uuid);
@@ -197,6 +208,15 @@ public class PlaywrightService {
                     context.close();
                 } catch (Exception e) {
                     log.warn("[{}] Error closing context: {}", uuid, e.getMessage());
+                }
+            }
+            // Close the per-meeting Playwright instance (and its Node.js process)
+            if (playwright != null) {
+                try {
+                    playwright.close();
+                    log.info("[{}] Playwright instance closed", uuid);
+                } catch (Exception e) {
+                    log.warn("[{}] Error closing Playwright: {}", uuid, e.getMessage());
                 }
             }
             activeContexts.remove(uuid);
@@ -417,6 +437,11 @@ public class PlaywrightService {
             throw new RuntimeException("Could not find any join button. The meeting page may not have loaded properly. Check screenshot.");
         }
 
+        // Handle recording/Gemini consent dialogs that may appear after clicking join
+        // (e.g. "This video call is being recorded and transcribed. Gemini is taking notes.")
+        Thread.sleep(2000);
+        handleRecordingConsentDialogs(page, uuid);
+
         // If we clicked "Ask to join", wait for host to admit us (up to 2 minutes)
         if (askedToJoin) {
             log.info("[{}] Waiting for host to admit us into the meeting (up to {} seconds)...", uuid, admissionTimeoutSeconds);
@@ -426,16 +451,168 @@ public class PlaywrightService {
                 throw new RuntimeException("Host did not admit the bot within " + admissionTimeoutSeconds + " seconds. The bot requested to join but was not let in.");
             }
             log.info("[{}] Successfully admitted to meeting!", uuid);
+            
+            // Consent dialogs can appear AFTER admission with a delay.
+            // Wait long enough for them to render before checking.
+            Thread.sleep(2000);
+            handleRecordingConsentDialogs(page, uuid);
         }
 
-        // Wait for meeting to load (reduced from 5s to 2s)
+        // Wait for meeting to load
         Thread.sleep(2000);
+        
+        // Final check for any late-appearing consent dialogs
+        handleRecordingConsentDialogs(page, uuid);
+        
         try {
             page.waitForLoadState(LoadState.NETWORKIDLE, new Page.WaitForLoadStateOptions().setTimeout(5000));
         } catch (Exception e) {
             log.debug("[{}] NETWORKIDLE timeout, continuing anyway", uuid);
         }
         log.info("[{}] Successfully joined meeting", uuid);
+    }
+
+    /**
+     * Handle consent/notification dialogs that appear when joining an organizational meeting:
+     *   1) "This video call is being recorded and transcribed. Gemini is taking notes."  (full dialog)
+     *   2) "Gemini is taking notes"  (smaller dialog)
+     *   3) "Your self view tile may show less..." / "Got it"  (self-view notification)
+     *
+     * All of these block the meeting until the user clicks "Join now" or "Got it".
+     * We retry a few times because dialogs can appear with a delay.
+     */
+    /**
+     * Handle consent/notification dialogs that appear when joining an organizational meeting.
+     * Uses JavaScript-based detection for reliability (Playwright text selectors can miss
+     * dynamically rendered dialog text).
+     *
+     * Returns true if a dialog was found and dismissed, false otherwise.
+     */
+    private boolean handleRecordingConsentDialogs(Page page, String uuid) {
+        log.info("[{}] Checking for recording/Gemini consent dialogs...", uuid);
+
+        boolean anyDismissed = false;
+        int maxAttempts = 5;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            boolean foundDialog = false;
+
+            try {
+                // --- Use JavaScript to detect AND dismiss consent dialogs ---
+                // This is more reliable than Playwright selectors for dynamically rendered dialogs
+                String detectAndDismissJS = """
+                    (function() {
+                        let result = { found: false, text: '', clicked: '', gotIt: false };
+
+                        // 1) Look for consent dialog text
+                        let consentPhrases = [
+                            'Gemini is taking notes',
+                            'being recorded and transcribed',
+                            'being recorded',
+                            'This video call is being recorded',
+                            'This call is being recorded',
+                            'recording in progress'
+                        ];
+
+                        let body = document.body ? document.body.innerText : '';
+                        for (let phrase of consentPhrases) {
+                            if (body.includes(phrase)) {
+                                result.found = true;
+                                result.text = phrase;
+                                break;
+                            }
+                        }
+
+                        // 2) If consent dialog detected, click "Join now"
+                        if (result.found) {
+                            // Find all clickable elements with "Join now" text
+                            let allEls = document.querySelectorAll('button, [role="button"], a, span, div[role="link"], [tabindex]');
+                            let joinCandidates = [];
+                            for (let el of allEls) {
+                                let t = (el.textContent || '').trim();
+                                if (t === 'Join now') {
+                                    joinCandidates.push(el);
+                                }
+                            }
+                            // Click the last matching "Join now" (the consent dialog one, not pre-join)
+                            if (joinCandidates.length > 0) {
+                                let target = joinCandidates[joinCandidates.length - 1];
+                                target.click();
+                                result.clicked = 'join-now:' + joinCandidates.length;
+                            } else {
+                                result.clicked = 'not-found';
+                            }
+                        }
+
+                        // 3) Also handle "Got it" notification (self-view, etc.)
+                        let allBtns = document.querySelectorAll('button, [role="button"]');
+                        for (let btn of allBtns) {
+                            let t = (btn.textContent || '').trim();
+                            if (t === 'Got it' && btn.offsetParent !== null) {
+                                btn.click();
+                                result.gotIt = true;
+                                break;
+                            }
+                        }
+
+                        return JSON.stringify(result);
+                    })()
+                    """;
+
+                Object rawResult = page.evaluate(detectAndDismissJS);
+                String resultStr = rawResult != null ? rawResult.toString() : "{}";
+                log.debug("[{}] Consent dialog JS result: {}", uuid, resultStr);
+
+                boolean consentFound = resultStr.contains("\"found\":true");
+                boolean joinClicked = resultStr.contains("join-now:");
+                boolean gotItClicked = resultStr.contains("\"gotIt\":true");
+
+                if (consentFound) {
+                    foundDialog = true;
+                    if (joinClicked) {
+                        log.info("[{}] Dismissed consent dialog via JS (clicked 'Join now')", uuid);
+                        anyDismissed = true;
+                        Thread.sleep(1500);
+                    } else {
+                        log.warn("[{}] Consent dialog detected but 'Join now' not found (attempt {}/{})", uuid, attempt, maxAttempts);
+                        // Fallback: try Playwright locators
+                        try {
+                            Locator joinBtn = page.locator("text='Join now'");
+                            if (joinBtn.count() > 0 && joinBtn.last().isVisible()) {
+                                joinBtn.last().click();
+                                log.info("[{}] Dismissed consent dialog via Playwright locator", uuid);
+                                anyDismissed = true;
+                                Thread.sleep(1500);
+                            }
+                        } catch (Exception e) {
+                            log.debug("[{}] Playwright fallback for consent failed: {}", uuid, e.getMessage());
+                        }
+                    }
+                }
+
+                if (gotItClicked) {
+                    log.info("[{}] Dismissed 'Got it' notification", uuid);
+                    foundDialog = true;
+                    anyDismissed = true;
+                    Thread.sleep(500);
+                }
+
+                // If no dialog was found on this attempt, we're done
+                if (!foundDialog) {
+                    if (attempt == 1) {
+                        log.info("[{}] No consent/notification dialogs detected", uuid);
+                    }
+                    break;
+                }
+
+                // Brief pause before checking for more dialogs
+                Thread.sleep(1000);
+
+            } catch (Exception e) {
+                log.debug("[{}] Error checking consent dialogs (attempt {}): {}", uuid, attempt, e.getMessage());
+                try { Thread.sleep(1000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); return anyDismissed; }
+            }
+        }
+        return anyDismissed;
     }
 
     private void saveFailureScreenshot(Page page, String uuid) {
@@ -547,6 +724,10 @@ public class PlaywrightService {
         // Wait for meeting UI to be fully ready after join
         Thread.sleep(2000);
 
+        // Check for late-appearing consent dialogs BEFORE attempting captions
+        // (these dialogs block the entire UI including keyboard shortcuts)
+        handleRecordingConsentDialogs(page, uuid);
+
         // Check if captions are already on
         if (areCaptionsAlreadyOn(page, uuid)) {
             log.info("[{}] Captions are already enabled!", uuid);
@@ -577,6 +758,16 @@ public class PlaywrightService {
                 log.warn("[{}] Keyboard shortcut failed on attempt {}: {}", uuid, attempt, e.getMessage());
             }
 
+            // After 2 failed attempts, check if a consent dialog appeared late and is blocking us
+            if (!captionsEnabled && attempt == 2) {
+                boolean dismissed = handleRecordingConsentDialogs(page, uuid);
+                if (dismissed) {
+                    log.info("[{}] Late consent dialog dismissed, retrying captions...", uuid);
+                    focusMeetingContent(page, uuid);
+                    Thread.sleep(500);
+                }
+            }
+
             if (!captionsEnabled && attempt < maxRetries) {
                 Thread.sleep(500);
             }
@@ -587,8 +778,39 @@ public class PlaywrightService {
             captionsEnabled = tryClickCaptionButton(page, uuid);
         }
 
+        // Last resort: check for consent dialog one more time, dismiss, and retry everything
         if (!captionsEnabled) {
-            log.error("[{}] FAILED to enable captions after {} attempts. Transcription may not work!", uuid, maxRetries);
+            boolean dismissed = handleRecordingConsentDialogs(page, uuid);
+            if (dismissed) {
+                log.info("[{}] Consent dialog was still blocking -- retrying captions after dismissal", uuid);
+                Thread.sleep(1000);
+                focusMeetingContent(page, uuid);
+
+                // Retry keyboard shortcut
+                for (int attempt = 1; attempt <= 3 && !captionsEnabled; attempt++) {
+                    try {
+                        focusMeetingContent(page, uuid);
+                        Thread.sleep(200);
+                        page.keyboard().press("c");
+                        Thread.sleep(800);
+                        if (areCaptionsAlreadyOn(page, uuid)) {
+                            captionsEnabled = true;
+                            log.info("[{}] Captions enabled on retry after consent dismissal!", uuid);
+                        }
+                    } catch (Exception e) {
+                        log.debug("[{}] Retry caption attempt {} failed: {}", uuid, attempt, e.getMessage());
+                    }
+                }
+
+                // Retry CC button
+                if (!captionsEnabled) {
+                    captionsEnabled = tryClickCaptionButton(page, uuid);
+                }
+            }
+        }
+
+        if (!captionsEnabled) {
+            log.error("[{}] FAILED to enable captions after all attempts. Transcription may not work!", uuid);
             try {
                 Path dir = Paths.get(transcriptPath);
                 Files.createDirectories(dir);
